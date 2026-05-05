@@ -1,0 +1,39 @@
+# ============================================================
+# .gitignore — AG Database Refresh Automation
+# ============================================================
+
+# Generated restore scripts — contain server-specific paths, never commit
+tscript.sql
+*tscript*.sql
+
+# Downloaded backup files
+*.bak
+
+# Log files
+*.log
+logs/
+
+# Secrets & credentials
+*.env
+*.pfx
+*.pem
+*.key
+*credentials*
+*secret*
+*password*
+*connectionstring*
+
+# Azure CLI cache
+.azure/
+
+# PowerShell
+*.ps1xml
+TestResults/
+
+# Editor & OS
+.vscode/settings.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+sql/DatabasePostRestore.sql

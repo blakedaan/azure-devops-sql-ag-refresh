@@ -1,0 +1,290 @@
+# =============================================================================
+# ag-refresh.yml — AG Database Refresh Execution Pipeline
+# =============================================================================
+# Source: YOUR_ORG GitHub org repo
+# Trigger: Manual only.
+#
+# Stage flow:
+#   1. Validate  — parameter check + verify prod backup files exist
+#   2. Refresh   — runs Invoke-AGDatabaseRefresh.ps1 on the primary replica
+#
+# PROD requires manual approval. URT, TRIAGE, STG run immediately.
+#
+# Variable group is selected dynamically based on TargetEnvironment.
+# Each variable group holds the environment-specific automation account
+# and SERVICE_CONNECTION pointing to the prod storage subscription.
+#
+# Notifications: configure via ADO Project Settings > Notifications
+#   (Build completed > Pipeline = AG Refresh — Run Refresh)
+# =============================================================================
+
+trigger: none
+pr:     none
+
+parameters:
+  - name: AvailabilityGroupName
+    displayName: 'Availability Group Name'
+    type: string
+
+  - name: DatabaseName
+    displayName: 'Database Name'
+    type: string
+    default: 'YOUR_DATABASE'
+
+  - name: BackupDate
+    displayName: 'Backup Date (yyyy-MM-dd)'
+    type: string
+
+  - name: PrimaryReplica
+    displayName: 'Primary Replica Server Name'
+    type: string
+
+  - name: SecondaryReplicas
+    displayName: 'Secondary Replicas (comma-separated, no spaces)'
+    type: string
+
+  - name: TargetEnvironment
+    displayName: 'Target Environment'
+    type: string
+    default: 'URT'
+    values:
+      - URT
+      - TRIAGE
+      - STG
+      - PROD
+
+  - name: StartAtPhase
+    displayName: 'Start At Phase'
+    type: string
+    default: 'Full'
+    values:
+      - Full
+      - Download
+      - PostDownload
+      - Cleanup
+
+  - name: SeedingTimeoutMinutes
+    displayName: 'Seeding Timeout (minutes)'
+    type: number
+    default: 125
+
+# =============================================================================
+# Variable group selected dynamically based on TargetEnvironment.
+# Each group contains: AUTOMATION_ACCOUNT_NAME, STORAGE_ACCOUNT_NAME,
+# CONTAINER_NAME, BACKUP_NAME_PREFIX, SERVICE_CONNECTION
+# =============================================================================
+variables:
+  - ${{ if eq(parameters.TargetEnvironment, 'URT') }}:
+    - group: ag-refresh-config-urt
+  - ${{ if eq(parameters.TargetEnvironment, 'TRIAGE') }}:
+    - group: ag-refresh-config-triage
+  - ${{ if eq(parameters.TargetEnvironment, 'STG') }}:
+    - group: ag-refresh-config-stg
+  - ${{ if eq(parameters.TargetEnvironment, 'PROD') }}:
+    - group: ag-refresh-config-prod
+
+# =============================================================================
+# Stage 1: Validate — pre-flight checks before any destructive operation
+# Runs on a Microsoft-hosted agent — no Hybrid Worker needed
+# =============================================================================
+stages:
+  - stage: Validate
+    displayName: 'Pre-Flight Validation'
+    jobs:
+      - job: PreFlightChecks
+        displayName: 'Validate parameters and backup file availability'
+        pool:
+          name: '$(AUTOMATION_ACCOUNT_NAME)'
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Validate parameters'
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                try {
+                    $date = [datetime]::ParseExact('${{ parameters.BackupDate }}', 'yyyy-MM-dd', $null)
+                    Write-Host "BackupDate valid: $($date.ToString('yyyy-MM-dd'))"
+                } catch {
+                    Write-Error "BackupDate '${{ parameters.BackupDate }}' is not in yyyy-MM-dd format."
+                    exit 1
+                }
+
+                $secondaries = '${{ parameters.SecondaryReplicas }}' -split ',' |
+                               ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                if ($secondaries.Count -eq 0) {
+                    Write-Error "SecondaryReplicas cannot be empty."
+                    exit 1
+                }
+
+                Write-Host "Parameters validated."
+                Write-Host "  AG:          ${{ parameters.AvailabilityGroupName }}"
+                Write-Host "  Database:    ${{ parameters.DatabaseName }}"
+                Write-Host "  BackupDate:  ${{ parameters.BackupDate }}"
+                Write-Host "  Primary:     ${{ parameters.PrimaryReplica }}"
+                Write-Host "  Secondaries: ${{ parameters.SecondaryReplicas }}"
+                Write-Host "  Environment: ${{ parameters.TargetEnvironment }}"
+
+          # SERVICE_CONNECTION comes from the environment-specific variable group.
+          # All environments currently pull from the same prod storage account.
+          # Service connection: your-service-connection
+          - task: AzurePowerShell@5
+            displayName: 'Validate backup files exist in prod Blob Storage'
+            inputs:
+              azureSubscription: '$(SERVICE_CONNECTION)'
+              ScriptType: InlineScript
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              Inline: |
+                $backupDate = [datetime]::ParseExact('${{ parameters.BackupDate }}', 'yyyy-MM-dd', $null)
+
+                $ctx = New-AzStorageContext `
+                    -StorageAccountName '$(STORAGE_ACCOUNT_NAME)' `
+                    -UseConnectedAccount
+
+                $blobs = Get-AzStorageBlob -Context $ctx -Container '$(CONTAINER_NAME)' |
+                         Where-Object {
+                             $_.Name -like '$(BACKUP_NAME_PREFIX)*.bak' -and
+                             $_.LastModified.UtcDateTime.Date -eq $backupDate.Date
+                         }
+
+                if (-not $blobs) {
+                    Write-Error "No backup files found for ${{ parameters.BackupDate }} with prefix '$(BACKUP_NAME_PREFIX)' in container '$(CONTAINER_NAME)'."
+                    Write-Error "Verify the BackupDate matches the file LastModified date in Azure Portal > yourstorageaccount."
+                    exit 1
+                }
+
+                $totalMB = [math]::Round(($blobs | Measure-Object -Property Length -Sum).Sum / 1MB, 0)
+                Write-Host "Found $($blobs.Count) backup file(s) -- ~${totalMB} MB -- for ${{ parameters.BackupDate }}."
+
+# =============================================================================
+# Stage 2: Refresh — runs the actual AG database refresh
+# Routes to the PRIMARY REPLICA Hybrid Worker via demands.
+# PROD requires manual approval. All other environments run immediately.
+# =============================================================================
+  - stage: Refresh
+    displayName: 'Run AG Database Refresh -- ${{ parameters.TargetEnvironment }}'
+    dependsOn: Validate
+    jobs:
+
+      - ${{ if eq(parameters.TargetEnvironment, 'PROD') }}:
+        - deployment: RunRefresh
+          displayName: 'Invoke-AGDatabaseRefresh on ${{ parameters.PrimaryReplica }}'
+          timeoutInMinutes: 180
+          environment: AG-REFRESH-PROD
+          pool:
+            name: '$(AUTOMATION_ACCOUNT_NAME)'
+            demands:
+              - Agent.Name -equals ${{ parameters.PrimaryReplica }}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+                  - task: PowerShell@2
+                    displayName: 'Run AG Database Refresh'
+                    inputs:
+                      pwsh: true
+                      filePath: 'scripts/Invoke-AGDatabaseRefresh.ps1'
+                      arguments: >
+                        -AvailabilityGroupName   '${{ parameters.AvailabilityGroupName }}'
+                        -DatabaseName            '${{ parameters.DatabaseName }}'
+                        -BackupDate              '${{ parameters.BackupDate }}'
+                        -PrimaryReplica          '${{ parameters.PrimaryReplica }}'
+                        -SecondaryReplicas       ('${{ parameters.SecondaryReplicas }}' -split ',')
+                        -StorageAccountName      '$(STORAGE_ACCOUNT_NAME)'
+                        -ContainerName           '$(CONTAINER_NAME)'
+                        -SeedingTimeoutMinutes   ${{ parameters.SeedingTimeoutMinutes }}
+                        -StartAtPhase            '${{ parameters.StartAtPhase }}'
+
+      - ${{ if eq(parameters.TargetEnvironment, 'TRIAGE') }}:
+        - deployment: RunRefresh
+          displayName: 'Invoke-AGDatabaseRefresh on ${{ parameters.PrimaryReplica }}'
+          timeoutInMinutes: 180
+          environment: AG-REFRESH-TRIAGE
+          pool:
+            name: '$(AUTOMATION_ACCOUNT_NAME)'
+            demands:
+              - Agent.Name -equals ${{ parameters.PrimaryReplica }}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+                  - task: PowerShell@2
+                    displayName: 'Run AG Database Refresh'
+                    inputs:
+                      pwsh: true
+                      filePath: 'scripts/Invoke-AGDatabaseRefresh.ps1'
+                      arguments: >
+                        -AvailabilityGroupName   '${{ parameters.AvailabilityGroupName }}'
+                        -DatabaseName            '${{ parameters.DatabaseName }}'
+                        -BackupDate              '${{ parameters.BackupDate }}'
+                        -PrimaryReplica          '${{ parameters.PrimaryReplica }}'
+                        -SecondaryReplicas       ('${{ parameters.SecondaryReplicas }}' -split ',')
+                        -StorageAccountName      '$(STORAGE_ACCOUNT_NAME)'
+                        -ContainerName           '$(CONTAINER_NAME)'
+                        -SeedingTimeoutMinutes   ${{ parameters.SeedingTimeoutMinutes }}
+                        -StartAtPhase            '${{ parameters.StartAtPhase }}'
+
+      - ${{ if eq(parameters.TargetEnvironment, 'STG') }}:
+        - deployment: RunRefresh
+          displayName: 'Invoke-AGDatabaseRefresh on ${{ parameters.PrimaryReplica }}'
+          timeoutInMinutes: 180
+          environment: AG-REFRESH-STG
+          pool:
+            name: '$(AUTOMATION_ACCOUNT_NAME)'
+            demands:
+              - Agent.Name -equals ${{ parameters.PrimaryReplica }}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+                  - task: PowerShell@2
+                    displayName: 'Run AG Database Refresh'
+                    inputs:
+                      pwsh: true
+                      filePath: 'scripts/Invoke-AGDatabaseRefresh.ps1'
+                      arguments: >
+                        -AvailabilityGroupName   '${{ parameters.AvailabilityGroupName }}'
+                        -DatabaseName            '${{ parameters.DatabaseName }}'
+                        -BackupDate              '${{ parameters.BackupDate }}'
+                        -PrimaryReplica          '${{ parameters.PrimaryReplica }}'
+                        -SecondaryReplicas       ('${{ parameters.SecondaryReplicas }}' -split ',')
+                        -StorageAccountName      '$(STORAGE_ACCOUNT_NAME)'
+                        -ContainerName           '$(CONTAINER_NAME)'
+                        -SeedingTimeoutMinutes   ${{ parameters.SeedingTimeoutMinutes }}
+                        -StartAtPhase            '${{ parameters.StartAtPhase }}'
+
+      - ${{ if eq(parameters.TargetEnvironment, 'URT') }}:
+        - deployment: RunRefresh
+          displayName: 'Invoke-AGDatabaseRefresh on ${{ parameters.PrimaryReplica }}'
+          timeoutInMinutes: 180
+          environment: AG-REFRESH-URT
+          pool:
+            name: '$(AUTOMATION_ACCOUNT_NAME)'
+            demands:
+              - Agent.Name -equals ${{ parameters.PrimaryReplica }}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+                  - task: PowerShell@2
+                    displayName: 'Run AG Database Refresh'
+                    inputs:
+                      pwsh: true
+                      filePath: 'scripts/Invoke-AGDatabaseRefresh.ps1'
+                      arguments: >
+                        -AvailabilityGroupName   '${{ parameters.AvailabilityGroupName }}'
+                        -DatabaseName            '${{ parameters.DatabaseName }}'
+                        -BackupDate              '${{ parameters.BackupDate }}'
+                        -PrimaryReplica          '${{ parameters.PrimaryReplica }}'
+                        -SecondaryReplicas       ('${{ parameters.SecondaryReplicas }}' -split ',')
+                        -StorageAccountName      '$(STORAGE_ACCOUNT_NAME)'
+                        -ContainerName           '$(CONTAINER_NAME)'
+                        -SeedingTimeoutMinutes   ${{ parameters.SeedingTimeoutMinutes }}
+                        -StartAtPhase            '${{ parameters.StartAtPhase }}'

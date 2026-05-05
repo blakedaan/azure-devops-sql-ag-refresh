@@ -1,0 +1,177 @@
+# =============================================================================
+# ag-deploy.yml — AG Refresh Script Deployment Pipeline
+# =============================================================================
+# Source: YOUR_ORG GitHub org repo
+# Triggers automatically when scripts or SQL files change on main.
+# Validates PowerShell syntax, then deploys all scripts and SQL files
+# to H:\WORKDIR\Scripts\ on every Hybrid Worker in the agent pool.
+#
+# This replaces the manual RDP + file copy process.
+# Every merge to main = automatic deployment to all workers.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - scripts/*
+      - sql/*
+
+pr: none
+
+variables:
+  - group: ag-refresh-config-urt   # provides AUTOMATION_ACCOUNT_NAME for the agent pool
+
+stages:
+
+# =============================================================================
+# Stage 1: Validate — syntax check all scripts before deploying
+# =============================================================================
+  - stage: Validate
+    displayName: 'Validate Scripts'
+    jobs:
+      - job: SyntaxCheck
+        displayName: 'PowerShell syntax check'
+        pool:
+          name: '$(AUTOMATION_ACCOUNT_NAME)'
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Check all .ps1 files for syntax errors'
+            inputs:
+              targetType: inline
+              script: |
+                $failed = 0
+
+                Get-ChildItem -Path scripts -Filter *.ps1 | ForEach-Object {
+                    $file = $_
+                    $content = Get-Content $file.FullName -Raw -ErrorAction Stop
+                    $errors = $null
+                    $null = [System.Management.Automation.Language.Parser]::ParseInput(
+                        $content, [ref]$null, [ref]$errors
+                    )
+
+                    if ($errors -and $errors.Count -gt 0) {
+                        Write-Host "FAIL: $($file.Name) — $($errors.Count) error(s)"
+                        foreach ($e in $errors) {
+                            $line = try { $e.Extent.StartLineNumber } catch { '?' }
+                            $msg  = try { $e.Message } catch { $e.ToString() }
+                            Write-Host "  --> Line $line : $msg"
+                        }
+                        $failed++
+                    } else {
+                        Write-Host "PASS: $($file.Name)"
+                    }
+                }
+
+                if ($failed -gt 0) {
+                    Write-Host "$failed script(s) failed syntax check."
+                    exit 1
+                }
+
+                Write-Host "All scripts passed syntax validation."
+
+          - task: PowerShell@2
+            displayName: 'Verify required files are present'
+            inputs:
+              targetType: inline
+              script: |
+                $required = @(
+                    'scripts/Invoke-AGDatabaseRefresh.ps1',
+                    'scripts/Download-SqlBackups.ps1',
+                    'scripts/CreateRefreshScript.ps1',
+                    'scripts/DatabaseRefresh.ps1',
+                    'scripts/PostRefreshScript.ps1',
+                    'sql/DatabasePostRestore.sql'
+                )
+
+                $missing = $required | Where-Object { -not (Test-Path $_) }
+
+                if ($missing) {
+                    $missing | ForEach-Object { Write-Error "Missing required file: $_" }
+                    exit 1
+                }
+
+                Write-Host "All required files present."
+
+# =============================================================================
+# Stage 2: Deploy — copy scripts to all Hybrid Workers
+# Runs on the Hybrid Worker pool — has direct access to H:\WORKDIR\Scripts\
+# No demands filter — deploys to ALL workers in the group simultaneously
+# =============================================================================
+  - stage: Deploy
+    displayName: 'Deploy Scripts to Hybrid Workers'
+    dependsOn: Validate
+    jobs:
+      - job: DeployScripts
+        displayName: 'Copy scripts to H:\WORKDIR\Scripts'
+        pool:
+          name: '$(AUTOMATION_ACCOUNT_NAME)'
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Create working directories if missing'
+            inputs:
+              targetType: inline
+              script: |
+                $dirs = @(
+                    'H:\WORKDIR\Scripts',
+                    'H:\WORKDIR\AutomatedRefresh',
+                    'H:\WORKDIR\Logs'
+                )
+                foreach ($dir in $dirs) {
+                    if (-not (Test-Path $dir)) {
+                        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+                        Write-Host "Created: $dir"
+                    } else {
+                        Write-Host "Exists:  $dir"
+                    }
+                }
+
+          - task: PowerShell@2
+            displayName: 'Deploy scripts and SQL to H:\WORKDIR\Scripts'
+            inputs:
+              targetType: inline
+              script: |
+                $dest = 'H:\WORKDIR\Scripts'
+
+                Get-ChildItem -Path scripts -Filter *.ps1 | ForEach-Object {
+                    Copy-Item $_.FullName -Destination (Join-Path $dest $_.Name) -Force
+                    Write-Host "Deployed: $($_.Name)"
+                }
+
+                Get-ChildItem -Path sql -Filter *.sql | ForEach-Object {
+                    Copy-Item $_.FullName -Destination (Join-Path $dest $_.Name) -Force
+                    Write-Host "Deployed: $($_.Name)"
+                }
+
+                Write-Host ""
+                Write-Host "Current contents of $dest :"
+                Get-ChildItem $dest | Select-Object Name, LastWriteTime, @{N='SizeKB';E={[math]::Round($_.Length/1KB,1)}} | Format-Table -AutoSize
+
+          - task: PowerShell@2
+            displayName: 'Verify deployment — confirm all files present on worker'
+            inputs:
+              targetType: inline
+              script: |
+                $required = @(
+                    'H:\WORKDIR\Scripts\Invoke-AGDatabaseRefresh.ps1',
+                    'H:\WORKDIR\Scripts\Download-SqlBackups.ps1',
+                    'H:\WORKDIR\Scripts\CreateRefreshScript.ps1',
+                    'H:\WORKDIR\Scripts\DatabaseRefresh.ps1',
+                    'H:\WORKDIR\Scripts\PostRefreshScript.ps1',
+                    'H:\WORKDIR\Scripts\DatabasePostRestore.sql'
+                )
+
+                $missing = $required | Where-Object { -not (Test-Path $_) }
+
+                if ($missing) {
+                    $missing | ForEach-Object { Write-Error "Deployment verification failed — missing: $_" }
+                    exit 1
+                }
+
+                Write-Host "Deployment verified — all required files present on worker: $env:COMPUTERNAME"

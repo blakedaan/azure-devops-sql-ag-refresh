@@ -1,0 +1,120 @@
+# =============================================================================
+# ag-validate.yml — PR Validation Pipeline
+# =============================================================================
+# Runs automatically on every pull request targeting main.
+# Source: YOUR_ORG GitHub org repo (not ADO Repos)
+# Validates all PowerShell scripts and verifies required files exist.
+#
+# Must be linked to the branch policy in ADO:
+#   Pipelines > [this pipeline] > Edit > Triggers > PR validation
+#   OR linked via ADO branch policy on the GitHub repo connection.
+#
+# Broken scripts cannot reach main. Ever.
+# =============================================================================
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+jobs:
+  - job: ValidateScripts
+    displayName: 'Validate scripts on PR'
+    pool:
+      vmImage: 'windows-latest'
+
+    steps:
+      - checkout: self
+
+      - task: PowerShell@2
+        displayName: 'PowerShell syntax check — all .ps1 files'
+        inputs:
+          pwsh: true
+          targetType: inline
+          script: |
+            $failed = 0
+
+            Get-ChildItem -Path scripts -Filter *.ps1 | ForEach-Object {
+                $parseErrors = $null
+                [System.Management.Automation.Language.Parser]::ParseFile(
+                    $_.FullName, [ref]$null, [ref]$parseErrors
+                ) | Out-Null
+
+                if ($parseErrors) {
+                    Write-Error "FAIL: $($_.Name)"
+                    $parseErrors | ForEach-Object { Write-Error "  $($_.Extent.StartLineNumber): $($_.Message)" }
+                    $failed++
+                } else {
+                    Write-Host "PASS: $($_.Name)"
+                }
+            }
+
+            if ($failed -gt 0) {
+                Write-Error "$failed script(s) failed syntax check."
+                exit 1
+            }
+
+            Write-Host "All scripts passed syntax validation."
+
+      - task: PowerShell@2
+        displayName: 'Verify all required files are present'
+        inputs:
+          pwsh: true
+          targetType: inline
+          script: |
+            $required = @(
+                'scripts/Invoke-AGDatabaseRefresh.ps1',
+                'scripts/Download-SqlBackups.ps1',
+                'scripts/CreateRefreshScript.ps1',
+                'scripts/DatabaseRefresh.ps1',
+                'scripts/PostRefreshScript.ps1',
+                'sql/DatabasePostRestore.sql',
+                'pipelines/ag-deploy.yml',
+                'pipelines/ag-refresh.yml'
+            )
+
+            $missing = $required | Where-Object { -not (Test-Path $_) }
+
+            if ($missing) {
+                $missing | ForEach-Object { Write-Error "Missing required file: $_" }
+                exit 1
+            }
+
+            Write-Host "All required files present."
+
+      - task: PowerShell@2
+        displayName: 'Check for accidental secrets in scripts'
+        inputs:
+          pwsh: true
+          targetType: inline
+          script: |
+            # Basic check for common secret patterns
+            # GitHub Advanced Security (GHAS) provides deeper scanning at the org level
+            $patterns = @(
+                'password\s*=\s*["''][^"'']+["'']',
+                'AuthSecret\s*=\s*["''][^"'']+["'']',
+                'StorageAccountKey',
+                'connectionString\s*=',
+                '-AsPlainText.*Force(?!.*KeyVault)'
+            )
+
+            $flagged = @()
+
+            Get-ChildItem -Path scripts,sql -Recurse -File | ForEach-Object {
+                $content = Get-Content $_.FullName -Raw
+                foreach ($pattern in $patterns) {
+                    if ($content -match $pattern) {
+                        $flagged += "$($_.Name): possible secret pattern '$pattern'"
+                    }
+                }
+            }
+
+            if ($flagged) {
+                Write-Warning "Potential secrets detected — review before merging:"
+                $flagged | ForEach-Object { Write-Warning "  $_" }
+                # Warning only — GHAS handles blocking at the org level
+            } else {
+                Write-Host "No obvious secret patterns detected."
+            }
